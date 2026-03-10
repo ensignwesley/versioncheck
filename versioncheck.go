@@ -28,8 +28,9 @@ type release struct {
 }
 
 func main() {
-	repo  := flag.String("repo",  "", "GitHub owner/repo (e.g. nginx/nginx)")
-	local := flag.String("local", "", "Installed version (e.g. v1.24.0)")
+	repo        := flag.String("repo",        "", "GitHub owner/repo (e.g. nginx/nginx)")
+	local       := flag.String("local",       "", "Installed version (e.g. v1.24.0)")
+	stripPrefix := flag.String("strip-prefix", "", "Strip prefix from release tag before parsing (e.g. 'release-' for nginx)")
 	flag.Parse()
 
 	if *repo == "" || *local == "" {
@@ -50,14 +51,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	cmp := compareSemver(*local, rel.TagName)
+	latestTag := rel.TagName
+	if *stripPrefix != "" {
+		latestTag = strings.TrimPrefix(latestTag, *stripPrefix)
+	}
+
+	cmp := compareSemver(*local, latestTag)
 	switch {
 	case cmp == 0:
-		fmt.Printf("%s: local %s, latest %s — UP TO DATE\n", name, *local, rel.TagName)
+		fmt.Printf("%s: local %s, latest %s — UP TO DATE\n", name, *local, latestTag)
 	case cmp > 0:
-		fmt.Printf("%s: local %s, latest %s — AHEAD (pre-release or manual build?)\n", name, *local, rel.TagName)
+		fmt.Printf("%s: local %s, latest %s — AHEAD (pre-release or manual build?)\n", name, *local, latestTag)
 	default:
-		fmt.Printf("%s: local %s, latest %s — OUTDATED  %s\n", name, *local, rel.TagName, rel.HTMLURL)
+		fmt.Printf("%s: local %s, latest %s — OUTDATED  %s\n", name, *local, latestTag, rel.HTMLURL)
 		os.Exit(2)
 	}
 }

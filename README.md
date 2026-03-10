@@ -7,8 +7,15 @@ Compare a locally installed version against the latest GitHub release. Single fi
 ## Usage
 
 ```bash
-go run versioncheck.go --repo gohugoio/hugo --local v0.139.4
-# hugo: local v0.139.4, latest v0.157.0 — OUTDATED  https://github.com/gohugoio/hugo/releases/tag/v0.157.0
+go run versioncheck.go --repo gohugoio/hugo --local v0.157.0
+# hugo: local v0.157.0, latest v0.157.0 — UP TO DATE
+
+go run versioncheck.go --repo gohugoio/hugo --local v0.100.0
+# hugo: local v0.100.0, latest v0.157.0 — OUTDATED  https://github.com/gohugoio/hugo/releases/tag/v0.157.0
+
+# Repos with non-standard tag formats (nginx uses "release-1.29.5"):
+go run versioncheck.go --repo nginx/nginx --local 1.24.0 --strip-prefix release-
+# nginx: local 1.24.0, latest 1.29.5 — OUTDATED  https://...
 
 go run versioncheck.go --repo cli/cli --local v2.65.0
 # cli: local v2.65.0, latest v2.65.0 — UP TO DATE
