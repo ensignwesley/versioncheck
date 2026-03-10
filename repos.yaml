@@ -1,0 +1,27 @@
+repos:
+  - name: Hugo
+    repo: gohugoio/hugo
+    local: v0.157.0
+
+  - name: Node.js (v22 LTS)
+    repo: nodejs/node
+    local: v22.22.0
+    # NOTE: shows v25 (current line) — tool doesn't understand LTS channels yet.
+    # Workaround: pin the check to the LTS release repo when available.
+
+  - name: nginx
+    repo: nginx/nginx
+    local: 1.24.0
+    strip_prefix: "release-"
+
+  - name: gh CLI
+    repo: cli/cli
+    local: v2.65.0
+
+  - name: ripgrep
+    repo: BurntSushi/ripgrep
+    local: v14.0.0
+
+  # NOTE: python/cpython uses git tags, not GitHub releases.
+  # The releases API returns 404 for cpython.
+  # Tag-based tracking is a planned feature.

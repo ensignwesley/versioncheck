@@ -1,12 +1,15 @@
-// versioncheck — compare a locally installed version against the latest GitHub release.
+// versioncheck — compare installed versions against the latest GitHub releases.
 //
-// Usage:
-//   go run versioncheck.go --repo owner/repo --local v1.0.0
+// Single-repo mode:
+//   go run versioncheck.go --repo owner/repo --local v1.0.0 [--strip-prefix release-]
+//
+// Multi-repo mode (reads repos.yaml):
+//   go run versioncheck.go --config repos.yaml
 //
 // Exit codes:
-//   0 — up to date
+//   0 — all up to date
 //   1 — usage or API error
-//   2 — outdated (useful for scripting)
+//   2 — one or more repos are outdated
 package main
 
 import (
@@ -17,24 +20,58 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+
+	"gopkg.in/yaml.v3"
 )
 
 const apiURL = "https://api.github.com/repos/%s/releases/latest"
 
+// Config file schema
+type Config struct {
+	Repos []RepoEntry `yaml:"repos"`
+}
+
+type RepoEntry struct {
+	Name        string `yaml:"name"`
+	Repo        string `yaml:"repo"`
+	Local       string `yaml:"local"`
+	StripPrefix string `yaml:"strip_prefix"`
+}
+
+// Result of a single version check
+type Result struct {
+	Name    string
+	Local   string
+	Latest  string
+	URL     string
+	Status  string // "UP TO DATE" | "OUTDATED" | "AHEAD" | "ERROR"
+	Err     error
+}
+
 type release struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
-	Name    string `json:"name"`
 }
 
 func main() {
-	repo        := flag.String("repo",        "", "GitHub owner/repo (e.g. nginx/nginx)")
-	local       := flag.String("local",       "", "Installed version (e.g. v1.24.0)")
-	stripPrefix := flag.String("strip-prefix", "", "Strip prefix from release tag before parsing (e.g. 'release-' for nginx)")
+	repo        := flag.String("repo",         "", "GitHub owner/repo (single-check mode)")
+	local       := flag.String("local",        "", "Installed version (single-check mode)")
+	stripPrefix := flag.String("strip-prefix", "", "Strip prefix from release tag (single-check mode)")
+	configFile  := flag.String("config",       "", "YAML config file (multi-check mode)")
 	flag.Parse()
 
+	// Multi-repo mode
+	if *configFile != "" {
+		runMulti(*configFile)
+		return
+	}
+
+	// Single-repo mode
 	if *repo == "" || *local == "" {
-		fmt.Fprintln(os.Stderr, "usage: versioncheck --repo owner/repo --local vX.Y.Z")
+		fmt.Fprintln(os.Stderr, "usage:")
+		fmt.Fprintln(os.Stderr, "  versioncheck --repo owner/repo --local vX.Y.Z [--strip-prefix PREFIX]")
+		fmt.Fprintln(os.Stderr, "  versioncheck --config repos.yaml")
 		os.Exit(1)
 	}
 
@@ -43,28 +80,150 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid repo format %q — want owner/repo\n", *repo)
 		os.Exit(1)
 	}
-	name := parts[1]
 
-	rel, err := latestRelease(*repo)
+	r := checkOne(RepoEntry{
+		Name:        parts[1],
+		Repo:        *repo,
+		Local:       *local,
+		StripPrefix: *stripPrefix,
+	})
+
+	printSingle(r)
+	if r.Status == "OUTDATED" {
+		os.Exit(2)
+	}
+}
+
+// runMulti reads a config file, checks all repos concurrently, prints a table.
+func runMulti(path string) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", *repo, err)
+		fmt.Fprintf(os.Stderr, "cannot read %s: %v\n", path, err)
 		os.Exit(1)
 	}
 
-	latestTag := rel.TagName
-	if *stripPrefix != "" {
-		latestTag = strings.TrimPrefix(latestTag, *stripPrefix)
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot parse %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	if len(cfg.Repos) == 0 {
+		fmt.Fprintln(os.Stderr, "no repos defined in config")
+		os.Exit(1)
 	}
 
-	cmp := compareSemver(*local, latestTag)
-	switch {
-	case cmp == 0:
-		fmt.Printf("%s: local %s, latest %s — UP TO DATE\n", name, *local, latestTag)
-	case cmp > 0:
-		fmt.Printf("%s: local %s, latest %s — AHEAD (pre-release or manual build?)\n", name, *local, latestTag)
+	// Check concurrently
+	results := make([]Result, len(cfg.Repos))
+	var wg sync.WaitGroup
+	for i, entry := range cfg.Repos {
+		wg.Add(1)
+		go func(idx int, e RepoEntry) {
+			defer wg.Done()
+			results[idx] = checkOne(e)
+		}(i, entry)
+	}
+	wg.Wait()
+
+	// Print aligned table
+	printTable(results)
+
+	// Exit 2 if any outdated
+	for _, r := range results {
+		if r.Status == "OUTDATED" {
+			os.Exit(2)
+		}
+	}
+}
+
+// checkOne performs a single version check.
+func checkOne(e RepoEntry) Result {
+	name := e.Name
+	if name == "" {
+		parts := strings.SplitN(e.Repo, "/", 2)
+		if len(parts) == 2 {
+			name = parts[1]
+		} else {
+			name = e.Repo
+		}
+	}
+
+	rel, err := latestRelease(e.Repo)
+	if err != nil {
+		return Result{Name: name, Local: e.Local, Status: "ERROR", Err: err}
+	}
+
+	latest := rel.TagName
+	if e.StripPrefix != "" {
+		latest = strings.TrimPrefix(latest, e.StripPrefix)
+	}
+
+	var status string
+	switch compareSemver(e.Local, latest) {
+	case 0:
+		status = "UP TO DATE"
+	case 1:
+		status = "AHEAD"
 	default:
-		fmt.Printf("%s: local %s, latest %s — OUTDATED  %s\n", name, *local, latestTag, rel.HTMLURL)
-		os.Exit(2)
+		status = "OUTDATED"
+	}
+
+	return Result{Name: name, Local: e.Local, Latest: latest, URL: rel.HTMLURL, Status: status}
+}
+
+// printSingle prints a single-line result (single-repo mode).
+func printSingle(r Result) {
+	if r.Err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", r.Name, r.Err)
+		return
+	}
+	switch r.Status {
+	case "UP TO DATE":
+		fmt.Printf("%s: local %s, latest %s — UP TO DATE\n", r.Name, r.Local, r.Latest)
+	case "AHEAD":
+		fmt.Printf("%s: local %s, latest %s — AHEAD (pre-release or manual build?)\n", r.Name, r.Local, r.Latest)
+	case "OUTDATED":
+		fmt.Printf("%s: local %s, latest %s — OUTDATED  %s\n", r.Name, r.Local, r.Latest, r.URL)
+	}
+}
+
+// printTable prints an aligned status table (multi-repo mode).
+func printTable(results []Result) {
+	// Column widths
+	wName, wLocal, wLatest := 4, 9, 6 // "Name", "Installed", "Latest" minimums
+	for _, r := range results {
+		if len(r.Name) > wName     { wName   = len(r.Name)   }
+		if len(r.Local) > wLocal   { wLocal  = len(r.Local)  }
+		if len(r.Latest) > wLatest { wLatest = len(r.Latest) }
+	}
+
+	header := fmt.Sprintf("%-*s  %-*s  %-*s  %s", wName, "Service", wLocal, "Installed", wLatest, "Latest", "Status")
+	fmt.Println(header)
+	fmt.Println(strings.Repeat("─", len(header)+10))
+
+	anyOutdated := false
+	for _, r := range results {
+		if r.Err != nil {
+			fmt.Printf("%-*s  %-*s  %-*s  ERROR: %v\n", wName, r.Name, wLocal, r.Local, wLatest, "—", r.Err)
+			continue
+		}
+		marker := "✓"
+		if r.Status == "OUTDATED" {
+			marker = "✗"
+			anyOutdated = true
+		} else if r.Status == "AHEAD" {
+			marker = "↑"
+		}
+		fmt.Printf("%-*s  %-*s  %-*s  %s %s\n", wName, r.Name, wLocal, r.Local, wLatest, r.Latest, marker, r.Status)
+	}
+
+	if anyOutdated {
+		fmt.Println()
+		fmt.Println("Outdated repos:")
+		for _, r := range results {
+			if r.Status == "OUTDATED" {
+				fmt.Printf("  %s → %s  %s\n", r.Local, r.Latest, r.URL)
+			}
+		}
 	}
 }
 
@@ -75,9 +234,14 @@ func latestRelease(repo string) (*release, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "versioncheck/0.1 (github.com/ensignwesley/versioncheck)")
+	req.Header.Set("User-Agent", "versioncheck/0.2 (github.com/ensignwesley/versioncheck)")
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	// Optional auth token for higher rate limits
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -87,7 +251,6 @@ func latestRelease(repo string) (*release, error) {
 
 	switch resp.StatusCode {
 	case 200:
-		// ok
 	case 404:
 		return nil, fmt.Errorf("no releases found (repo may not exist or have no releases)")
 	case 403:
@@ -103,35 +266,26 @@ func latestRelease(repo string) (*release, error) {
 	return &rel, nil
 }
 
-// compareSemver returns -1, 0, or 1 comparing a to b.
-// Strips leading "v" and pre-release suffixes (e.g. v1.2.3-beta → 1.2.3).
-// Falls back to string equality if parsing fails.
+// compareSemver returns -1, 0, or 1 comparing a to b (semver-aware).
 func compareSemver(a, b string) int {
 	an := parseVer(a)
 	bn := parseVer(b)
 	for i := 0; i < 3; i++ {
-		if an[i] < bn[i] {
-			return -1
-		}
-		if an[i] > bn[i] {
-			return 1
-		}
+		if an[i] < bn[i] { return -1 }
+		if an[i] > bn[i] { return 1 }
 	}
 	return 0
 }
 
 func parseVer(s string) [3]int {
 	s = strings.TrimPrefix(s, "v")
-	// Drop pre-release / build metadata: v1.2.3-beta+001 → "1.2.3"
 	if idx := strings.IndexAny(s, "-+"); idx != -1 {
 		s = s[:idx]
 	}
 	parts := strings.SplitN(s, ".", 3)
 	var out [3]int
 	for i, p := range parts {
-		if i >= 3 {
-			break
-		}
+		if i >= 3 { break }
 		n, _ := strconv.Atoi(p)
 		out[i] = n
 	}

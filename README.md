@@ -1,53 +1,91 @@
 # versioncheck
 
-Proof-of-concept for [Project Discovery #6](https://wesley.thesisko.com/posts/project-discovery-6-version-blindness/) — the version blindness problem.
+Compare installed versions against the latest GitHub releases. Single-file Go tool, concurrent checks, aligned table output.
 
-Compare a locally installed version against the latest GitHub release. Single file, zero dependencies, standard library only.
+Part of [Project Discovery #6](https://wesley.thesisko.com/posts/project-discovery-6-version-blindness/) — the version blindness problem.
 
 ## Usage
 
+**Single-repo mode:**
 ```bash
 go run versioncheck.go --repo gohugoio/hugo --local v0.157.0
 # hugo: local v0.157.0, latest v0.157.0 — UP TO DATE
 
 go run versioncheck.go --repo gohugoio/hugo --local v0.100.0
-# hugo: local v0.100.0, latest v0.157.0 — OUTDATED  https://github.com/gohugoio/hugo/releases/tag/v0.157.0
+# hugo: local v0.100.0, latest v0.157.0 — OUTDATED  https://...
 
-# Repos with non-standard tag formats (nginx uses "release-1.29.5"):
+# Repos with non-standard tag formats:
 go run versioncheck.go --repo nginx/nginx --local 1.24.0 --strip-prefix release-
 # nginx: local 1.24.0, latest 1.29.5 — OUTDATED  https://...
-
-go run versioncheck.go --repo cli/cli --local v2.65.0
-# cli: local v2.65.0, latest v2.65.0 — UP TO DATE
 ```
+
+**Multi-repo mode:**
+```bash
+go run versioncheck.go --config repos.yaml
+```
+```
+Service            Installed  Latest    Status
+────────────────────────────────────────────────────────
+Hugo               v0.157.0   v0.157.0  ✓ UP TO DATE
+Node.js (v22 LTS)  v22.22.0   v25.8.0   ✗ OUTDATED
+nginx              1.24.0     1.29.5    ✗ OUTDATED
+gh CLI             v2.65.0    v2.87.3   ✗ OUTDATED
+ripgrep            v14.0.0    15.1.0    ✗ OUTDATED
+
+Outdated repos:
+  v22.22.0 → v25.8.0  https://github.com/nodejs/node/releases/tag/v25.8.0
+  ...
+```
+
+## Config file format (`repos.yaml`)
+
+```yaml
+repos:
+  - name: Hugo
+    repo: gohugoio/hugo
+    local: v0.157.0
+
+  - name: nginx
+    repo: nginx/nginx
+    local: 1.24.0
+    strip_prefix: "release-"   # strips "release-" from "release-1.29.5"
+```
+
+Fields:
+- `name` — display name (optional, defaults to repo name)
+- `repo` — GitHub `owner/repo`
+- `local` — installed version
+- `strip_prefix` — strip literal prefix from release tag before parsing
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Up to date (or ahead) |
+| 0 | All repos up to date |
 | 1 | Usage error or API failure |
-| 2 | Outdated — useful for scripting |
+| 2 | One or more repos outdated — useful for scripting/CI |
 
-## What it does
+## Authentication
 
-1. Hits `api.github.com/repos/{owner}/{repo}/releases/latest`
-2. Parses the `tag_name` field
-3. Strips `v` prefix and pre-release suffixes (`v1.2.3-beta` → `[1,2,3]`)
-4. Compares numerically (handles `v1.9.0 < v1.10.0` correctly)
-5. Prints result and sets exit code
+Set `GITHUB_TOKEN` for authenticated API access (5000 req/hr vs 60 req/hr unauthenticated):
+```bash
+export GITHUB_TOKEN=ghp_...
+go run versioncheck.go --config repos.yaml
+```
 
-## What it doesn't do
+## Known limitations
 
-This is a POC. No cron, no persistence, no multi-repo config file, no notifications.
-The full version (folded into Service Manifest) would:
-- Read repos from the service manifest YAML
-- Store `installed_version` alongside service definitions
-- Run daily and notify via webhook/Telegram when drift is detected
+**Repos using git tags instead of GitHub releases** (e.g. `python/cpython`) will return an error. The GitHub releases API is distinct from the tags API — tag-based tracking is a planned feature.
 
-## Limitation
+**Release channels** (LTS vs current): the tool fetches the latest release regardless of channel. `nodejs/node` will report v25 (current) even if you're intentionally on v22 (LTS). Planned: optional `channel` or `max_major` field to constrain comparisons.
 
-Repos that don't use semver tags (`release-1.29.5`, `nginx-1.24.0`) will produce unexpected comparisons. The full implementation would need a configurable tag-to-version normalizer per repo.
+**Non-semver tags**: repos using calendar versioning, commit hashes, or other formats will produce unexpected comparisons. The `strip_prefix` field handles common prefix patterns; arbitrary tag normalization is not yet supported.
+
+## What this is not
+
+This is a POC, not a production tool. No cron, no notifications, no persistence, no web UI.
+
+The full version (folded into [Service Manifest](https://wesley.thesisko.com/posts/project-discovery-2-service-manifest/)) would read repos directly from the service manifest — no separate watchlist to maintain.
 
 ## Part of
 
