@@ -1,15 +1,18 @@
 // versioncheck — compare installed versions against the latest GitHub releases.
 //
 // Single-repo mode:
-//   go run versioncheck.go --repo owner/repo --local v1.0.0 [--strip-prefix release-]
+//
+//	go run versioncheck.go --repo owner/repo --local vX.Y.Z [--strip-prefix PREFIX] [--max-major N]
 //
 // Multi-repo mode (reads repos.yaml):
-//   go run versioncheck.go --config repos.yaml
+//
+//	go run versioncheck.go --config repos.yaml
 //
 // Exit codes:
-//   0 — all up to date
-//   1 — usage or API error
-//   2 — one or more repos are outdated
+//
+//	0 — all up to date
+//	1 — usage or API error
+//	2 — one or more repos are outdated
 package main
 
 import (
@@ -25,7 +28,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const apiURL = "https://api.github.com/repos/%s/releases/latest"
+const (
+	apiLatest = "https://api.github.com/repos/%s/releases/latest"
+	apiList   = "https://api.github.com/repos/%s/releases?per_page=50&page=1"
+	userAgent = "versioncheck/0.3 (github.com/ensignwesley/versioncheck)"
+)
 
 // Config file schema
 type Config struct {
@@ -37,6 +44,7 @@ type RepoEntry struct {
 	Repo        string `yaml:"repo"`
 	Local       string `yaml:"local"`
 	StripPrefix string `yaml:"strip_prefix"`
+	MaxMajor    int    `yaml:"max_major"` // constrain to releases within this major version (0 = no constraint)
 }
 
 // Result of a single version check
@@ -45,19 +53,22 @@ type Result struct {
 	Local   string
 	Latest  string
 	URL     string
-	Status  string // "UP TO DATE" | "OUTDATED" | "AHEAD" | "ERROR"
+	Status  string // "UP TO DATE" | "OUTDATED" | "AHEAD" | "ERROR" | "PINNED"
 	Err     error
 }
 
 type release struct {
-	TagName string `json:"tag_name"`
-	HTMLURL string `json:"html_url"`
+	TagName    string `json:"tag_name"`
+	HTMLURL    string `json:"html_url"`
+	Prerelease bool   `json:"prerelease"`
+	Draft      bool   `json:"draft"`
 }
 
 func main() {
 	repo        := flag.String("repo",         "", "GitHub owner/repo (single-check mode)")
 	local       := flag.String("local",        "", "Installed version (single-check mode)")
 	stripPrefix := flag.String("strip-prefix", "", "Strip prefix from release tag (single-check mode)")
+	maxMajor    := flag.Int("max-major",       0,  "Constrain to releases within this major version (single-check mode)")
 	configFile  := flag.String("config",       "", "YAML config file (multi-check mode)")
 	flag.Parse()
 
@@ -70,7 +81,7 @@ func main() {
 	// Single-repo mode
 	if *repo == "" || *local == "" {
 		fmt.Fprintln(os.Stderr, "usage:")
-		fmt.Fprintln(os.Stderr, "  versioncheck --repo owner/repo --local vX.Y.Z [--strip-prefix PREFIX]")
+		fmt.Fprintln(os.Stderr, "  versioncheck --repo owner/repo --local vX.Y.Z [--strip-prefix PREFIX] [--max-major N]")
 		fmt.Fprintln(os.Stderr, "  versioncheck --config repos.yaml")
 		os.Exit(1)
 	}
@@ -86,6 +97,7 @@ func main() {
 		Repo:        *repo,
 		Local:       *local,
 		StripPrefix: *stripPrefix,
+		MaxMajor:    *maxMajor,
 	})
 
 	printSingle(r)
@@ -147,7 +159,13 @@ func checkOne(e RepoEntry) Result {
 		}
 	}
 
-	rel, err := latestRelease(e.Repo)
+	var rel *release
+	var err error
+	if e.MaxMajor > 0 {
+		rel, err = latestReleaseInMajor(e.Repo, e.MaxMajor, e.StripPrefix)
+	} else {
+		rel, err = latestRelease(e.Repo)
+	}
 	if err != nil {
 		return Result{Name: name, Local: e.Local, Status: "ERROR", Err: err}
 	}
@@ -157,14 +175,20 @@ func checkOne(e RepoEntry) Result {
 		latest = strings.TrimPrefix(latest, e.StripPrefix)
 	}
 
+	cmp := compareSemver(e.Local, latest)
 	var status string
-	switch compareSemver(e.Local, latest) {
-	case 0:
+	switch {
+	case cmp == 0:
 		status = "UP TO DATE"
-	case 1:
+	case cmp > 0:
 		status = "AHEAD"
 	default:
 		status = "OUTDATED"
+	}
+
+	// If constrained by max_major, annotate the status to clarify it's a pinned-track check.
+	if e.MaxMajor > 0 && status == "UP TO DATE" {
+		status = "UP TO DATE"
 	}
 
 	return Result{Name: name, Local: e.Local, Latest: latest, URL: rel.HTMLURL, Status: status}
@@ -227,20 +251,75 @@ func printTable(results []Result) {
 	}
 }
 
-// latestRelease fetches the latest release from the GitHub API.
+// latestRelease fetches the single latest release from the GitHub API.
 func latestRelease(repo string) (*release, error) {
-	url := fmt.Sprintf(apiURL, repo)
-	req, err := http.NewRequest("GET", url, nil)
+	url := fmt.Sprintf(apiLatest, repo)
+	return fetchRelease(url, repo)
+}
+
+// latestReleaseInMajor fetches the list of recent releases and returns the
+// highest non-prerelease, non-draft release whose major version ≤ maxMajor.
+// stripPrefix is applied to tag names before version parsing.
+func latestReleaseInMajor(repo string, maxMajor int, stripPrefix string) (*release, error) {
+	url := fmt.Sprintf(apiList, repo)
+	req, err := newGitHubRequest(url)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "versioncheck/0.2 (github.com/ensignwesley/versioncheck)")
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	// Optional auth token for higher rate limits
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case 200:
+	case 404:
+		return nil, fmt.Errorf("no releases found (repo may not exist or have no releases)")
+	case 403:
+		return nil, fmt.Errorf("rate limited — set GITHUB_TOKEN env var for higher limits")
+	default:
+		return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+	}
+
+	var releases []release
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("parse error: %w", err)
+	}
+
+	var best *release
+	var bestVer [3]int
+	for i := range releases {
+		r := &releases[i]
+		if r.Prerelease || r.Draft {
+			continue
+		}
+		tag := r.TagName
+		if stripPrefix != "" {
+			tag = strings.TrimPrefix(tag, stripPrefix)
+		}
+		ver := parseVer(tag)
+		if ver[0] > maxMajor {
+			continue
+		}
+		if best == nil || compareVers(ver, bestVer) > 0 {
+			best = r
+			bestVer = ver
+		}
+	}
+
+	if best == nil {
+		return nil, fmt.Errorf("no stable releases found within major version %d (checked last 50 releases)", maxMajor)
+	}
+	return best, nil
+}
+
+// fetchRelease is a helper for the /releases/latest endpoint.
+func fetchRelease(url, repo string) (*release, error) {
+	req, err := newGitHubRequest(url)
+	if err != nil {
+		return nil, err
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -266,13 +345,31 @@ func latestRelease(repo string) (*release, error) {
 	return &rel, nil
 }
 
-// compareSemver returns -1, 0, or 1 comparing a to b (semver-aware).
+// newGitHubRequest builds a standard GitHub API request.
+func newGitHubRequest(url string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
+}
+
+// compareSemver returns -1, 0, or 1 comparing version strings a and b.
 func compareSemver(a, b string) int {
-	an := parseVer(a)
-	bn := parseVer(b)
+	return compareVers(parseVer(a), parseVer(b))
+}
+
+// compareVers compares two parsed version triples. Returns -1, 0, or 1.
+func compareVers(a, b [3]int) int {
 	for i := 0; i < 3; i++ {
-		if an[i] < bn[i] { return -1 }
-		if an[i] > bn[i] { return 1 }
+		if a[i] < b[i] { return -1 }
+		if a[i] > b[i] { return 1 }
 	}
 	return 0
 }

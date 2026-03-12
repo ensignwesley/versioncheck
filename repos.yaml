@@ -6,8 +6,7 @@ repos:
   - name: Node.js (v22 LTS)
     repo: nodejs/node
     local: v22.22.0
-    # NOTE: shows v25 (current line) — tool doesn't understand LTS channels yet.
-    # Workaround: pin the check to the LTS release repo when available.
+    max_major: 22   # constrain to v22.x — ignores v24/v25 current line
 
   - name: nginx
     repo: nginx/nginx
